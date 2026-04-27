@@ -287,6 +287,8 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
             incremental_output = True
 
         base_address = get_http_base_address(credentials)
+        
+        print(f"base_address:{base_address}")
 
         # The parameter `enable_omni_output_audio_url` must be set to true when using the Omni model in non-streaming mode.
         if model.startswith("qwen3-omni-") and not stream:
@@ -316,6 +318,7 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
                 base_address=base_address,
             )
         if stream:
+            print(f"model:{model},credentials:{credentials},prompt_messages:{prompt_messages}")
             return self._handle_generate_stream_response(
                 model,
                 credentials,
