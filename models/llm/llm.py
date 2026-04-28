@@ -7,7 +7,7 @@ import uuid
 from collections.abc import Generator
 from http import HTTPStatus
 from pathlib import Path
-from typing import Optional, Union, cast
+from typing import Any, Optional, Union, cast
 
 import requests
 from dashscope import Generation, MultiModalConversation, get_tokenizer
@@ -61,7 +61,13 @@ from dify_plugin.errors.model import (
     InvokeServerUnavailableError,
 )
 from dify_plugin.interfaces.model.large_language_model import LargeLanguageModel
-from openai import OpenAI
+from openai import (
+    APIConnectionError as OpenAIAPIConnectionError,
+    APIStatusError,
+    AuthenticationError as OpenAIAuthenticationError,
+    OpenAI,
+    RateLimitError as OpenAIRateLimitError,
+)
 from models._common import get_http_base_address
 from ..constant import BURY_POINT_HEADER
 
@@ -74,6 +80,19 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._temp_files = []
+
+    @staticmethod
+    def _normalize_model_name(model: str) -> str:
+        if model.endswith(".yaml"):
+            return Path(model).stem
+        return model
+
+    @staticmethod
+    def _is_openai_compatible_base_address(base_address: str) -> bool:
+        return (
+            "/v1" in base_address.rstrip("/")
+            and "dashscope.aliyuncs.com/api" not in base_address
+        )
 
     def _invoke(
         self,
@@ -126,6 +145,7 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         :param tools: tools for tool calling
         :return:
         """
+        model = self._normalize_model_name(model)
         if self.get_customizable_model_schema(model, credentials) is not None:
             return 0
         if model in {"qwen-turbo-chat", "qwen-plus-chat"}:
@@ -148,6 +168,7 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         :param credentials: model credentials
         :return:
         """
+        model = self._normalize_model_name(model)
         try:
             self._generate(
                 model=model,
@@ -183,6 +204,8 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         :param user: unique user id
         :return: full response or stream response chunk generator result
         """
+        model = self._normalize_model_name(model)
+        model_parameters = dict(model_parameters or {})
         credentials_kwargs = self._to_credential_kwargs(credentials)
         mode = self.get_model_mode(model, credentials)
         if model in {"qwen-turbo-chat", "qwen-plus-chat"}:
@@ -287,8 +310,18 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
             incremental_output = True
 
         base_address = get_http_base_address(credentials)
-        
-        print(f"base_address:{base_address}")
+
+        if self._is_openai_compatible_base_address(base_address):
+            return self._generate_openai_chat(
+                model=model,
+                credentials=credentials,
+                base_address=base_address,
+                prompt_messages=prompt_messages,
+                model_parameters=model_parameters,
+                tools=tools,
+                stop=stop,
+                stream=stream,
+            )
 
         # The parameter `enable_omni_output_audio_url` must be set to true when using the Omni model in non-streaming mode.
         if model.startswith("qwen3-omni-") and not stream:
@@ -318,7 +351,6 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
                 base_address=base_address,
             )
         if stream:
-            print(f"model:{model},credentials:{credentials},prompt_messages:{prompt_messages}")
             return self._handle_generate_stream_response(
                 model,
                 credentials,
@@ -328,6 +360,330 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
             )
         return self._handle_generate_response(
             model, credentials, response, prompt_messages
+        )
+
+    def _generate_openai_chat(
+        self,
+        model: str,
+        credentials: dict,
+        base_address: str,
+        prompt_messages: list[PromptMessage],
+        model_parameters: dict,
+        tools: Optional[list[PromptMessageTool]] = None,
+        stop: Optional[list[str]] = None,
+        stream: bool = True,
+    ) -> Union[LLMResult, Generator]:
+        client = OpenAI(
+            api_key=credentials["useasy_api_key"],
+            base_url=base_address.rstrip("/"),
+        )
+        messages = self._convert_prompt_messages_to_openai_messages(prompt_messages)
+        extra_headers_str = model_parameters.pop("extra_headers", "")
+        headers = self._get_market_bury_point_header(messages, extra_headers_str)
+
+        request_kwargs, extra_body = self._split_openai_model_parameters(
+            model_parameters
+        )
+        request_kwargs.update(
+            {
+                "model": model,
+                "messages": messages,
+                "stream": stream,
+            }
+        )
+        if tools:
+            request_kwargs["tools"] = self._convert_tools_for_openai(tools)
+        if stop:
+            request_kwargs["stop"] = stop
+        if headers:
+            request_kwargs["extra_headers"] = headers
+        if extra_body:
+            request_kwargs["extra_body"] = extra_body
+        if stream:
+            request_kwargs["stream_options"] = {"include_usage": True}
+
+        try:
+            response = client.chat.completions.create(**request_kwargs)
+        except OpenAIAuthenticationError as ex:
+            raise InvokeAuthorizationError(str(ex)) from ex
+        except OpenAIRateLimitError as ex:
+            raise InvokeRateLimitError(str(ex)) from ex
+        except OpenAIAPIConnectionError as ex:
+            raise InvokeConnectionError(str(ex)) from ex
+        except APIStatusError as ex:
+            self._handle_error_response(
+                ex.status_code,
+                getattr(ex.response, "text", str(ex)),
+                model,
+                getattr(ex.response, "headers", {}).get("x-request-id"),
+            )
+
+        if stream:
+            return self._handle_openai_stream_response(
+                model,
+                credentials,
+                response,
+                prompt_messages,
+            )
+        return self._handle_openai_response(
+            model,
+            credentials,
+            response,
+            prompt_messages,
+        )
+
+    @staticmethod
+    def _split_openai_model_parameters(model_parameters: dict) -> tuple[dict, dict]:
+        openai_parameters = {
+            "frequency_penalty",
+            "logit_bias",
+            "max_completion_tokens",
+            "max_tokens",
+            "metadata",
+            "n",
+            "parallel_tool_calls",
+            "presence_penalty",
+            "reasoning_effort",
+            "response_format",
+            "seed",
+            "service_tier",
+            "temperature",
+            "tool_choice",
+            "top_logprobs",
+            "top_p",
+            "user",
+        }
+        request_kwargs = {}
+        extra_body = {}
+        for key, value in model_parameters.items():
+            if value is None:
+                continue
+            if key in openai_parameters:
+                request_kwargs[key] = value
+            else:
+                extra_body[key] = value
+        return request_kwargs, extra_body
+
+    def _convert_prompt_messages_to_openai_messages(
+        self, prompt_messages: list[PromptMessage]
+    ) -> list[dict[str, Any]]:
+        openai_messages = []
+        for prompt_message in prompt_messages:
+            role = prompt_message.role.value
+            if isinstance(prompt_message, ToolPromptMessage):
+                openai_messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": prompt_message.tool_call_id,
+                        "content": prompt_message.content or "",
+                    }
+                )
+                continue
+
+            message: dict[str, Any] = {"role": role}
+            if isinstance(prompt_message.content, str) or prompt_message.content is None:
+                message["content"] = prompt_message.content or ""
+            else:
+                content = []
+                for message_content in prompt_message.content:
+                    if message_content.type == PromptMessageContentType.TEXT:
+                        message_content = cast(TextPromptMessageContent, message_content)
+                        content.append({"type": "text", "text": message_content.data})
+                    elif message_content.type == PromptMessageContentType.IMAGE:
+                        message_content = cast(ImagePromptMessageContent, message_content)
+                        content.append(
+                            {
+                                "type": "image_url",
+                                "image_url": {"url": message_content.data},
+                            }
+                        )
+                    else:
+                        content.append({"type": "text", "text": message_content.data})
+                message["content"] = content
+
+            if isinstance(prompt_message, AssistantPromptMessage) and prompt_message.tool_calls:
+                message["tool_calls"] = [
+                    {
+                        "id": tool_call.id,
+                        "type": tool_call.type,
+                        "function": {
+                            "name": tool_call.function.name,
+                            "arguments": tool_call.function.arguments,
+                        },
+                    }
+                    for tool_call in prompt_message.tool_calls
+                ]
+            openai_messages.append(message)
+        return openai_messages
+
+    @staticmethod
+    def _convert_tools_for_openai(tools: list[PromptMessageTool]) -> list[dict]:
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in tools
+        ]
+
+    def _handle_openai_response(
+        self,
+        model: str,
+        credentials: dict,
+        response,
+        prompt_messages: list[PromptMessage],
+    ) -> LLMResult:
+        try:
+            choice = response.choices[0]
+            message = choice.message
+            tool_calls = []
+            for tool_call in message.tool_calls or []:
+                tool_calls.append(
+                    AssistantPromptMessage.ToolCall(
+                        id=tool_call.id,
+                        type=tool_call.type,
+                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                            name=tool_call.function.name,
+                            arguments=tool_call.function.arguments,
+                        ),
+                    )
+                )
+            assistant_prompt_message = AssistantPromptMessage(
+                content=message.content or "",
+                tool_calls=tool_calls,
+            )
+            usage = self._calc_openai_usage(model, credentials, response.usage)
+            return LLMResult(
+                model=model,
+                message=assistant_prompt_message,
+                prompt_messages=prompt_messages,
+                usage=usage,
+            )
+        finally:
+            self._cleanup_temp_files()
+
+    def _handle_openai_stream_response(
+        self,
+        model: str,
+        credentials: dict,
+        responses,
+        prompt_messages: list[PromptMessage],
+    ) -> Generator:
+        tool_calls: dict[int, dict[str, Any]] = {}
+        is_reasoning = False
+        usage = None
+        try:
+            for index, chunk in enumerate(responses):
+                if chunk.usage:
+                    usage = self._calc_openai_usage(model, credentials, chunk.usage)
+                if not chunk.choices:
+                    continue
+
+                choice = chunk.choices[0]
+                delta = choice.delta
+                content_parts = []
+                reasoning_content = getattr(delta, "reasoning_content", None)
+                if reasoning_content is None and getattr(delta, "model_extra", None):
+                    reasoning_content = delta.model_extra.get("reasoning_content")
+                if reasoning_content:
+                    if not is_reasoning:
+                        content_parts.append("<think>\n")
+                        is_reasoning = True
+                    content_parts.append(reasoning_content)
+
+                if delta.content:
+                    if is_reasoning:
+                        content_parts.append("\n</think>")
+                        is_reasoning = False
+                    content_parts.append(delta.content)
+
+                if delta.tool_calls:
+                    for tool_call_delta in delta.tool_calls:
+                        tool_call_index = tool_call_delta.index or 0
+                        tool_call = tool_calls.setdefault(
+                            tool_call_index,
+                            {
+                                "id": tool_call_delta.id or "",
+                                "type": tool_call_delta.type or "function",
+                                "function": {"name": "", "arguments": ""},
+                            },
+                        )
+                        if tool_call_delta.id:
+                            tool_call["id"] = tool_call_delta.id
+                        if tool_call_delta.type:
+                            tool_call["type"] = tool_call_delta.type
+                        if tool_call_delta.function:
+                            if tool_call_delta.function.name:
+                                tool_call["function"][
+                                    "name"
+                                ] += tool_call_delta.function.name
+                            if tool_call_delta.function.arguments:
+                                tool_call["function"]["arguments"] += (
+                                    tool_call_delta.function.arguments
+                                )
+
+                finish_reason = choice.finish_reason
+                if finish_reason and is_reasoning:
+                    content_parts.append("\n</think>")
+                    is_reasoning = False
+
+                if not content_parts and not finish_reason:
+                    continue
+
+                assistant_prompt_message = AssistantPromptMessage(
+                    content="".join(content_parts)
+                )
+                if finish_reason and tool_calls:
+                    assistant_prompt_message.tool_calls = [
+                        AssistantPromptMessage.ToolCall(
+                            id=tool_call["id"] or tool_call["function"]["name"],
+                            type=tool_call["type"],
+                            function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                name=tool_call["function"]["name"],
+                                arguments=tool_call["function"]["arguments"],
+                            ),
+                        )
+                        for _, tool_call in sorted(tool_calls.items())
+                    ]
+
+                yield LLMResultChunk(
+                    model=model,
+                    prompt_messages=prompt_messages,
+                    delta=LLMResultChunkDelta(
+                        index=index,
+                        message=assistant_prompt_message,
+                        finish_reason=finish_reason,
+                        usage=usage if finish_reason else None,
+                    ),
+                )
+        except OpenAIAuthenticationError as ex:
+            raise InvokeAuthorizationError(str(ex)) from ex
+        except OpenAIRateLimitError as ex:
+            raise InvokeRateLimitError(str(ex)) from ex
+        except OpenAIAPIConnectionError as ex:
+            raise InvokeConnectionError(str(ex)) from ex
+        except APIStatusError as ex:
+            self._handle_error_response(
+                ex.status_code,
+                getattr(ex.response, "text", str(ex)),
+                model,
+                getattr(ex.response, "headers", {}).get("x-request-id"),
+            )
+        finally:
+            self._cleanup_temp_files()
+
+    def _calc_openai_usage(self, model: str, credentials: dict, usage) -> Any:
+        if usage is None:
+            return None
+        return self._calc_response_usage(
+            model,
+            credentials,
+            usage.prompt_tokens or 0,
+            usage.completion_tokens or 0,
         )
 
     def _handle_generate_response(

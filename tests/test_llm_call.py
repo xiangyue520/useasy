@@ -40,7 +40,19 @@ def get_all_models() -> list[str]:
     models: list[str] = []
     for item in data:
         if isinstance(item, str) and item.strip():
-            model_name = item.strip()
+            model_entry = item.strip()
+            model_name = model_entry
+            if model_entry.endswith(".yaml"):
+                model_file = models_dir / model_entry
+                if not model_file.exists():
+                    raise FileNotFoundError(f"Missing model config file: {model_file}")
+                try:
+                    model_data = yaml.safe_load(model_file.read_text(encoding="utf-8"))
+                except yaml.YAMLError as exc:
+                    raise ValueError(f"Invalid YAML in {model_file}") from exc
+                if not isinstance(model_data, dict) or not model_data.get("model"):
+                    raise ValueError(f"Missing model field in {model_file}")
+                model_name = str(model_data["model"]).strip()
             if model_name in EXCLUDED_MODELS:
                 continue
             models.append(model_name)

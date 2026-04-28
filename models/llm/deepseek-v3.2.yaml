@@ -1,4 +1,4 @@
-model: qwene-deepseek-v3.2
+model: deepseek-v3.2
 label:
   zh_Hans: DeepSeek-V3.2
   en_US: DeepSeek-V3.2
