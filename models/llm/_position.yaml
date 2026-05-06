@@ -3,12 +3,9 @@
 - deepseek-v3.2.yaml
 - deepseek-v3.yaml
 - glm-5.yaml
-- qwen-flash.yaml
 - qwen-long.yaml
 - qwen-max-latest.yaml
-- qwen-max-longcontext.yaml
 - qwen-max.yaml
-- qwen-plus-chat.yaml
 - qwen-plus-latest.yaml
 - qwen-plus.yaml
 - qwen-vl-max-latest.yaml
@@ -48,3 +45,5 @@
 - qwen3-vl-plus.yaml
 - qwen3.5-plus.yaml
 - qwen3.6-plus.yaml
+- doubao-api.yaml
+- doubao-seed-1.6-flash.yaml

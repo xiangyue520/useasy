@@ -387,23 +387,20 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         request_kwargs.update(
             {
                 "model": model,
-                "messages": messages,
+                "input": messages,
                 "stream": stream,
             }
         )
         if tools:
             request_kwargs["tools"] = self._convert_tools_for_openai(tools)
         if stop:
-            request_kwargs["stop"] = stop
+            extra_body["stop"] = stop
         if headers:
             request_kwargs["extra_headers"] = headers
         if extra_body:
             request_kwargs["extra_body"] = extra_body
-        if stream:
-            request_kwargs["stream_options"] = {"include_usage": True}
-
         try:
-            response = client.chat.completions.create(**request_kwargs)
+            response = client.responses.create(**request_kwargs)
         except OpenAIAuthenticationError as ex:
             raise InvokeAuthorizationError(str(ex)) from ex
         except OpenAIRateLimitError as ex:
@@ -435,22 +432,29 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
     @staticmethod
     def _split_openai_model_parameters(model_parameters: dict) -> tuple[dict, dict]:
         openai_parameters = {
-            "frequency_penalty",
-            "logit_bias",
-            "max_completion_tokens",
-            "max_tokens",
+            "background",
+            "conversation",
+            "include",
+            "instructions",
+            "max_output_tokens",
+            "max_tool_calls",
             "metadata",
-            "n",
             "parallel_tool_calls",
-            "presence_penalty",
-            "reasoning_effort",
-            "response_format",
-            "seed",
+            "previous_response_id",
+            "prompt",
+            "prompt_cache_key",
+            "reasoning",
+            "safety_identifier",
             "service_tier",
+            "store",
+            "stream_options",
+            "reasoning_effort",
             "temperature",
+            "text",
             "tool_choice",
             "top_logprobs",
             "top_p",
+            "truncation",
             "user",
         }
         request_kwargs = {}
@@ -458,7 +462,15 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         for key, value in model_parameters.items():
             if value is None:
                 continue
-            if key in openai_parameters:
+            if key == "max_tokens":
+                request_kwargs["max_output_tokens"] = value
+            elif key == "response_format":
+                request_kwargs["text"] = {
+                    "format": value if isinstance(value, dict) else {"type": value}
+                }
+            elif key == "reasoning_effort":
+                request_kwargs["reasoning"] = {"effort": value}
+            elif key in openai_parameters:
                 request_kwargs[key] = value
             else:
                 extra_body[key] = value
@@ -473,9 +485,9 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
             if isinstance(prompt_message, ToolPromptMessage):
                 openai_messages.append(
                     {
-                        "role": "tool",
-                        "tool_call_id": prompt_message.tool_call_id,
-                        "content": prompt_message.content or "",
+                        "type": "function_call_output",
+                        "call_id": prompt_message.tool_call_id,
+                        "output": prompt_message.content or "",
                     }
                 )
                 continue
@@ -488,31 +500,35 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
                 for message_content in prompt_message.content:
                     if message_content.type == PromptMessageContentType.TEXT:
                         message_content = cast(TextPromptMessageContent, message_content)
-                        content.append({"type": "text", "text": message_content.data})
+                        content.append({"type": "input_text", "text": message_content.data})
                     elif message_content.type == PromptMessageContentType.IMAGE:
                         message_content = cast(ImagePromptMessageContent, message_content)
                         content.append(
                             {
-                                "type": "image_url",
-                                "image_url": {"url": message_content.data},
+                                "type": "input_image",
+                                "image_url": message_content.data,
                             }
                         )
                     else:
-                        content.append({"type": "text", "text": message_content.data})
+                        content.append({"type": "input_text", "text": message_content.data})
                 message["content"] = content
 
             if isinstance(prompt_message, AssistantPromptMessage) and prompt_message.tool_calls:
-                message["tool_calls"] = [
-                    {
-                        "id": tool_call.id,
-                        "type": tool_call.type,
-                        "function": {
+                if message.get("content"):
+                    message["type"] = "message"
+                    openai_messages.append(message)
+                for tool_call in prompt_message.tool_calls:
+                    openai_messages.append(
+                        {
+                            "type": "function_call",
+                            "call_id": tool_call.id,
                             "name": tool_call.function.name,
                             "arguments": tool_call.function.arguments,
-                        },
-                    }
-                    for tool_call in prompt_message.tool_calls
-                ]
+                        }
+                    )
+                continue
+
+            message["type"] = "message"
             openai_messages.append(message)
         return openai_messages
 
@@ -521,11 +537,10 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         return [
             {
                 "type": "function",
-                "function": {
-                    "name": tool.name,
-                    "description": tool.description,
-                    "parameters": tool.parameters,
-                },
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.parameters,
+                "strict": False,
             }
             for tool in tools
         ]
@@ -538,22 +553,21 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         prompt_messages: list[PromptMessage],
     ) -> LLMResult:
         try:
-            choice = response.choices[0]
-            message = choice.message
             tool_calls = []
-            for tool_call in message.tool_calls or []:
-                tool_calls.append(
-                    AssistantPromptMessage.ToolCall(
-                        id=tool_call.id,
-                        type=tool_call.type,
-                        function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                            name=tool_call.function.name,
-                            arguments=tool_call.function.arguments,
-                        ),
+            for output_item in response.output or []:
+                if getattr(output_item, "type", None) == "function_call":
+                    tool_calls.append(
+                        AssistantPromptMessage.ToolCall(
+                            id=output_item.call_id or output_item.id or output_item.name,
+                            type="function",
+                            function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                name=output_item.name,
+                                arguments=output_item.arguments,
+                            ),
+                        )
                     )
-                )
             assistant_prompt_message = AssistantPromptMessage(
-                content=message.content or "",
+                content=response.output_text or "",
                 tool_calls=tool_calls,
             )
             usage = self._calc_openai_usage(model, credentials, response.usage)
@@ -577,87 +591,127 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
         is_reasoning = False
         usage = None
         try:
-            for index, chunk in enumerate(responses):
-                if chunk.usage:
-                    usage = self._calc_openai_usage(model, credentials, chunk.usage)
-                if not chunk.choices:
-                    continue
+            for index, event in enumerate(responses):
+                event_type = getattr(event, "type", "")
 
-                choice = chunk.choices[0]
-                delta = choice.delta
-                content_parts = []
-                reasoning_content = getattr(delta, "reasoning_content", None)
-                if reasoning_content is None and getattr(delta, "model_extra", None):
-                    reasoning_content = delta.model_extra.get("reasoning_content")
-                if reasoning_content:
+                if event_type in (
+                    "response.reasoning_text.delta",
+                    "response.reasoning_summary_text.delta",
+                ):
+                    content_parts = []
                     if not is_reasoning:
                         content_parts.append("<think>\n")
                         is_reasoning = True
-                    content_parts.append(reasoning_content)
+                    content_parts.append(event.delta)
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=AssistantPromptMessage(
+                                content="".join(content_parts)
+                            ),
+                        ),
+                    )
+                    continue
 
-                if delta.content:
+                if event_type == "response.output_text.delta":
+                    content = event.delta
                     if is_reasoning:
-                        content_parts.append("\n</think>")
+                        content = "\n</think>" + content
                         is_reasoning = False
-                    content_parts.append(delta.content)
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=AssistantPromptMessage(content=content),
+                        ),
+                    )
+                    continue
 
-                if delta.tool_calls:
-                    for tool_call_delta in delta.tool_calls:
-                        tool_call_index = tool_call_delta.index or 0
+                if event_type == "response.function_call_arguments.delta":
+                    tool_call_index = getattr(event, "output_index", 0) or 0
+                    tool_call = tool_calls.setdefault(
+                        tool_call_index,
+                        {
+                            "id": getattr(event, "item_id", "") or "",
+                            "type": "function",
+                            "function": {"name": "", "arguments": ""},
+                        },
+                    )
+                    tool_call["function"]["arguments"] += event.delta
+                    continue
+
+                if event_type == "response.output_item.done":
+                    item = event.item
+                    if getattr(item, "type", None) == "function_call":
+                        tool_call_index = getattr(event, "output_index", 0) or 0
                         tool_call = tool_calls.setdefault(
                             tool_call_index,
                             {
-                                "id": tool_call_delta.id or "",
-                                "type": tool_call_delta.type or "function",
+                                "id": "",
+                                "type": "function",
                                 "function": {"name": "", "arguments": ""},
                             },
                         )
-                        if tool_call_delta.id:
-                            tool_call["id"] = tool_call_delta.id
-                        if tool_call_delta.type:
-                            tool_call["type"] = tool_call_delta.type
-                        if tool_call_delta.function:
-                            if tool_call_delta.function.name:
-                                tool_call["function"][
-                                    "name"
-                                ] += tool_call_delta.function.name
-                            if tool_call_delta.function.arguments:
-                                tool_call["function"]["arguments"] += (
-                                    tool_call_delta.function.arguments
-                                )
-
-                finish_reason = choice.finish_reason
-                if finish_reason and is_reasoning:
-                    content_parts.append("\n</think>")
-                    is_reasoning = False
-
-                if not content_parts and not finish_reason:
+                        tool_call["id"] = item.call_id or item.id or item.name
+                        tool_call["function"]["name"] = item.name
+                        tool_call["function"]["arguments"] = item.arguments
                     continue
 
-                assistant_prompt_message = AssistantPromptMessage(
-                    content="".join(content_parts)
-                )
-                if finish_reason and tool_calls:
-                    assistant_prompt_message.tool_calls = [
-                        AssistantPromptMessage.ToolCall(
-                            id=tool_call["id"] or tool_call["function"]["name"],
-                            type=tool_call["type"],
-                            function=AssistantPromptMessage.ToolCall.ToolCallFunction(
-                                name=tool_call["function"]["name"],
-                                arguments=tool_call["function"]["arguments"],
-                            ),
-                        )
-                        for _, tool_call in sorted(tool_calls.items())
-                    ]
+                if event_type in ("response.completed", "response.incomplete"):
+                    response = event.response
+                    usage = self._calc_openai_usage(model, credentials, response.usage)
+                    finish_reason = (
+                        "length"
+                        if event_type == "response.incomplete"
+                        else "stop"
+                    )
+                    assistant_prompt_message = AssistantPromptMessage(content="")
+                    if tool_calls:
+                        assistant_prompt_message.tool_calls = [
+                            AssistantPromptMessage.ToolCall(
+                                id=tool_call["id"]
+                                or tool_call["function"]["name"],
+                                type=tool_call["type"],
+                                function=AssistantPromptMessage.ToolCall.ToolCallFunction(
+                                    name=tool_call["function"]["name"],
+                                    arguments=tool_call["function"]["arguments"],
+                                ),
+                            )
+                            for _, tool_call in sorted(tool_calls.items())
+                        ]
+                    if is_reasoning:
+                        assistant_prompt_message.content = "\n</think>"
+                        is_reasoning = False
+                    yield LLMResultChunk(
+                        model=model,
+                        prompt_messages=prompt_messages,
+                        delta=LLMResultChunkDelta(
+                            index=index,
+                            message=assistant_prompt_message,
+                            finish_reason=finish_reason,
+                            usage=usage,
+                        ),
+                    )
+                    continue
 
+                if event_type == "response.failed":
+                    response = event.response
+                    message = response.error.message if response.error else "response failed"
+                    self._handle_error_response(400, message, model, response.id)
+
+                if event_type == "error":
+                    self._handle_error_response(400, event.message, model)
+
+            if is_reasoning:
                 yield LLMResultChunk(
                     model=model,
                     prompt_messages=prompt_messages,
                     delta=LLMResultChunkDelta(
-                        index=index,
-                        message=assistant_prompt_message,
-                        finish_reason=finish_reason,
-                        usage=usage if finish_reason else None,
+                        index=index + 1,
+                        message=AssistantPromptMessage(content="\n</think>"),
                     ),
                 )
         except OpenAIAuthenticationError as ex:
@@ -679,11 +733,17 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
     def _calc_openai_usage(self, model: str, credentials: dict, usage) -> Any:
         if usage is None:
             return None
+        prompt_tokens = getattr(usage, "input_tokens", None)
+        if prompt_tokens is None:
+            prompt_tokens = getattr(usage, "prompt_tokens", 0)
+        completion_tokens = getattr(usage, "output_tokens", None)
+        if completion_tokens is None:
+            completion_tokens = getattr(usage, "completion_tokens", 0)
         return self._calc_response_usage(
             model,
             credentials,
-            usage.prompt_tokens or 0,
-            usage.completion_tokens or 0,
+            prompt_tokens or 0,
+            completion_tokens or 0,
         )
 
     def _handle_generate_response(
@@ -1348,7 +1408,7 @@ class UseasyLargeLanguageModel(LargeLanguageModel):
                   If no valid information can be extracted, returns the default BURY_POINT_HEADER
         """
         res_bury_point_header = {}
-        system_entries = [entry for entry in messages if entry["role"] == "system"]
+        system_entries = [entry for entry in messages if entry.get("role") == "system"]
         if system_entries:
             system_entry = system_entries[0].get("content", "")
             if system_entry:

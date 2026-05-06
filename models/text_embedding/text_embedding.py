@@ -5,9 +5,23 @@ import yaml
 from typing import Optional
 import dashscope
 import numpy as np
+from openai import (
+    APIConnectionError as OpenAIAPIConnectionError,
+    APIStatusError,
+    AuthenticationError as OpenAIAuthenticationError,
+    OpenAI,
+    RateLimitError as OpenAIRateLimitError,
+)
 from dify_plugin.entities.model import EmbeddingInputType, PriceType
 from dify_plugin.entities.model.text_embedding import EmbeddingUsage, MultiModalContent, MultiModalContentType, MultiModalEmbeddingResult, TextEmbeddingResult
-from dify_plugin.errors.model import CredentialsValidateFailedError
+from dify_plugin.errors.model import (
+    CredentialsValidateFailedError,
+    InvokeAuthorizationError,
+    InvokeBadRequestError,
+    InvokeConnectionError,
+    InvokeRateLimitError,
+    InvokeServerUnavailableError,
+)
 from dify_plugin.interfaces.model.text_embedding_model import TextEmbeddingModel
 from models._common import _CommonUseasy, get_http_base_address
 from ..constant import BURY_POINT_HEADER
@@ -18,6 +32,19 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
     """
     Model class for Useasy text embedding model.
     """
+
+    @staticmethod
+    def _is_openai_compatible_base_address(base_address: str) -> bool:
+        return (
+            "/v1" in base_address.rstrip("/")
+            and "dashscope.aliyuncs.com/api" not in base_address
+        )
+
+    @staticmethod
+    def _normalize_model_name(model: str) -> str:
+        if model.endswith(".yaml"):
+            return model.removesuffix(".yaml")
+        return model
 
     def _invoke(
         self,
@@ -37,6 +64,7 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
         :param input_type: input type
         :return: embeddings result
         """
+        model = self._normalize_model_name(model)
         http_base_address = get_http_base_address(credentials)
         credentials_kwargs = self._to_credential_kwargs(credentials)
         context_size = self._get_context_size(model, credentials)
@@ -90,6 +118,7 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
         :param credentials: model credentials
         :return:
         """
+        model = self._normalize_model_name(model)
         try:
             credentials_kwargs = self._to_credential_kwargs(credentials)
             http_base_address = get_http_base_address(credentials)
@@ -119,6 +148,13 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
         Returns:
             List of embeddings, one for each text, and tokens usage.
         """
+        if UseasyTextEmbeddingModel._is_openai_compatible_base_address(base_address):
+            return UseasyTextEmbeddingModel.embed_documents_openai_compatible(
+                credentials_kwargs=credentials_kwargs,
+                model=model,
+                texts=texts,
+                base_address=base_address,
+            )
 
         # If the model is vision model, it has different endpoint
         # transfer and call embed_multimodal_documents
@@ -191,6 +227,36 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
         return ([list(map(float, e)) for e in embeddings], embedding_used_tokens)
 
     @staticmethod
+    def embed_documents_openai_compatible(
+        credentials_kwargs: dict,
+        model: str,
+        texts: list[str],
+        base_address: str,
+    ) -> tuple[list[list[float]], int]:
+        client = OpenAI(
+            api_key=credentials_kwargs["useasy_api_key"],
+            base_url=base_address.rstrip("/"),
+        )
+        try:
+            response = client.embeddings.create(
+                model=model,
+                input=texts,
+                extra_headers=BURY_POINT_HEADER,
+            )
+        except OpenAIAuthenticationError as ex:
+            raise InvokeAuthorizationError(str(ex)) from ex
+        except OpenAIRateLimitError as ex:
+            raise InvokeRateLimitError(str(ex)) from ex
+        except OpenAIAPIConnectionError as ex:
+            raise InvokeConnectionError(str(ex)) from ex
+        except APIStatusError as ex:
+            UseasyTextEmbeddingModel._handle_openai_error(ex, model)
+
+        embeddings = [item.embedding for item in sorted(response.data, key=lambda item: item.index)]
+        used_tokens = response.usage.total_tokens if response.usage else 0
+        return ([list(map(float, embedding)) for embedding in embeddings], used_tokens)
+
+    @staticmethod
     def _is_vision_model(model: str) -> bool:
         """
         Check whether there is a YAML configuration file in the current directory and whether it includes vision features.
@@ -256,6 +322,7 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
         :param input_type: input type
         :return: embeddings result
         """
+        model = self._normalize_model_name(model)
         http_base_address = get_http_base_address(credentials)
         credentials_kwargs = self._to_credential_kwargs(credentials)
         (embeddings_batch, embedding_used_tokens) = self.embed_multimodal_documents(
@@ -288,6 +355,14 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
         Returns:
             List of embeddings, one for each text, and tokens usage.
         """
+        if UseasyTextEmbeddingModel._is_openai_compatible_base_address(base_address):
+            return UseasyTextEmbeddingModel.embed_multimodal_documents_openai_compatible(
+                credentials_kwargs=credentials_kwargs,
+                model=model,
+                documents=documents,
+                base_address=base_address,
+            )
+
         def detect_image_format(base64_str: str) -> str:
             """
             Detect image format from base664 string
@@ -370,3 +445,51 @@ class UseasyTextEmbeddingModel(_CommonUseasy, TextEmbeddingModel):
                 raise ValueError(f"Response usage is missing or does not contain total tokens: {response}")
                 
         return ([list(map(float, e)) for e in embeddings], embedding_used_tokens)
+
+    @staticmethod
+    def embed_multimodal_documents_openai_compatible(
+        credentials_kwargs: dict,
+        model: str,
+        documents: list[MultiModalContent],
+        base_address: str,
+    ) -> tuple[list[list[float]], int]:
+        inputs = []
+        for document in documents:
+            if document.content_type == MultiModalContentType.TEXT:
+                inputs.append(document.content)
+            elif document.content_type == MultiModalContentType.IMAGE:
+                image_url = document.content
+                if not image_url.startswith(("http://", "https://", "data:")):
+                    image_url = f"data:image/png;base64,{image_url}"
+                inputs.append(
+                    [
+                        {
+                            "type": "input_image",
+                            "image_url": image_url,
+                        }
+                    ]
+                )
+            else:
+                raise ValueError(f"Unsupported content type: {document.content_type}")
+
+        return UseasyTextEmbeddingModel.embed_documents_openai_compatible(
+            credentials_kwargs=credentials_kwargs,
+            model=model,
+            texts=inputs,
+            base_address=base_address,
+        )
+
+    @staticmethod
+    def _handle_openai_error(ex: APIStatusError, model: str) -> None:
+        message = getattr(ex.response, "text", str(ex))
+        error_msg = (
+            f"Failed to invoke embedding model {model}, "
+            f"status code: {ex.status_code}, message: {message}"
+        )
+        if ex.status_code in (401, 403):
+            raise InvokeAuthorizationError(error_msg) from ex
+        if ex.status_code == 429:
+            raise InvokeRateLimitError(error_msg) from ex
+        if ex.status_code >= 500:
+            raise InvokeServerUnavailableError(error_msg) from ex
+        raise InvokeBadRequestError(error_msg) from ex

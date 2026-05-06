@@ -74,7 +74,7 @@ def test_llm_invoke(model_name: str) -> None:
         provider="useasy",
         model_type=ModelType.LLM,
         model=model_name,
-        credentials={"useasy_api_key": api_key,"base_url":"https://dev1-aihub.useasy.cn:32717/v1"},
+        credentials={"useasy_api_key": api_key,"base_url":"https://dev1-aihub.useasy.cn/v1"},
         prompt_messages=[{"role": "user", "content": "Say hello in one word."}],
         model_parameters={"max_tokens": 100},
         stop=None,

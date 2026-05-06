@@ -1,5 +1,6 @@
 from typing import Optional
 import dashscope
+import requests
 from dashscope.common.error import (
     AuthenticationError,
     InvalidParameter,
@@ -22,10 +23,21 @@ from dify_plugin.interfaces.model.rerank_model import RerankModel
 from models._common import get_http_base_address
 from ..constant import BURY_POINT_HEADER
 
+
 class GTERerankModel(RerankModel):
     """
     Model class for GTE rerank model.
     """
+
+    @staticmethod
+    def _is_new_api_base_address(base_address: str) -> bool:
+        return True
+
+    @staticmethod
+    def _normalize_model_name(model: str) -> str:
+        if model.endswith(".yaml"):
+            return model.removesuffix(".yaml")
+        return model
 
     def _invoke(
         self,
@@ -49,9 +61,20 @@ class GTERerankModel(RerankModel):
         :param user: unique user id
         :return: rerank result
         """
+        model = self._normalize_model_name(model)
         if len(docs) == 0:
             return RerankResult(model=model, docs=docs)
         http_base_address = get_http_base_address(credentials)
+        if self._is_new_api_base_address(http_base_address):
+            return self._invoke_new_api(
+                model=model,
+                credentials=credentials,
+                base_address=http_base_address,
+                query=query,
+                docs=docs,
+                score_threshold=score_threshold,
+                top_n=top_n,
+            )
         response = dashscope.TextReRank.call(
             query=query,
             headers=BURY_POINT_HEADER,
@@ -67,7 +90,9 @@ class GTERerankModel(RerankModel):
             return RerankResult(model=model, docs=rerank_documents)
         for _, result in enumerate(response.output.results):
             rerank_document = RerankDocument(
-                index=result.index, score=result.relevance_score, text=result["document"]["text"]
+                index=result.index,
+                score=result.relevance_score,
+                text=result["document"]["text"],
             )
             if score_threshold is not None:
                 if result.relevance_score >= score_threshold:
@@ -75,6 +100,111 @@ class GTERerankModel(RerankModel):
             else:
                 rerank_documents.append(rerank_document)
         return RerankResult(model=model, docs=rerank_documents)
+
+    def _invoke_new_api(
+        self,
+        model: str,
+        credentials: dict,
+        base_address: str,
+        query: str,
+        docs: list[str],
+        score_threshold: Optional[float] = None,
+        top_n: Optional[int] = None,
+    ) -> RerankResult:
+        payload = {
+            "model": model,
+            "query": query,
+            "documents": docs,
+        }
+        if top_n is not None:
+            payload["top_n"] = top_n
+
+        try:
+            response = requests.post(
+                f"{base_address.rstrip('/')}/rerank",
+                headers={
+                    "Authorization": f"Bearer {credentials['useasy_api_key']}",
+                    "Content-Type": "application/json",
+                    **BURY_POINT_HEADER,
+                },
+                json=payload,
+                timeout=300,
+            )
+        except requests.ConnectionError as ex:
+            raise InvokeConnectionError(str(ex)) from ex
+        except requests.Timeout as ex:
+            raise InvokeServerUnavailableError(str(ex)) from ex
+        except requests.RequestException as ex:
+            raise InvokeConnectionError(str(ex)) from ex
+
+        if response.status_code >= 400:
+            self._handle_new_api_error(response, model)
+
+        try:
+            data = response.json()
+        except ValueError as ex:
+            raise InvokeBadRequestError(
+                f"Failed to parse rerank model {model} response: {response.text}"
+            ) from ex
+        raw_results = data.get("results")
+        if raw_results is None:
+            raw_results = data.get("data", [])
+
+        rerank_documents = []
+        for result in raw_results or []:
+            index = result.get("index")
+            if index is None:
+                index = result.get("document_index")
+            if index is None:
+                continue
+
+            score = result.get("relevance_score")
+            if score is None:
+                score = result.get("score")
+            if score is None:
+                score = result.get("relevanceScore", 0)
+
+            text = ""
+            document = result.get("document")
+            if isinstance(document, dict):
+                text = document.get("text") or document.get("content") or ""
+            elif isinstance(document, str):
+                text = document
+            if not text and 0 <= index < len(docs):
+                text = docs[index]
+
+            score = float(score)
+            if score_threshold is not None and score < score_threshold:
+                continue
+            rerank_documents.append(
+                RerankDocument(index=int(index), score=score, text=text)
+            )
+
+        return RerankResult(model=model, docs=rerank_documents)
+
+    def _handle_new_api_error(self, response: requests.Response, model: str) -> None:
+        try:
+            error = response.json()
+        except ValueError:
+            error = response.text
+
+        message = error
+        if isinstance(error, dict):
+            message = error.get("message") or error.get("error") or error
+            if isinstance(message, dict):
+                message = message.get("message") or message
+
+        error_msg = (
+            f"Failed to invoke rerank model {model}, "
+            f"status code: {response.status_code}, message: {message}"
+        )
+        if response.status_code in (401, 403):
+            raise InvokeAuthorizationError(error_msg)
+        if response.status_code == 429:
+            raise InvokeRateLimitError(error_msg)
+        if response.status_code >= 500:
+            raise InvokeServerUnavailableError(error_msg)
+        raise InvokeBadRequestError(error_msg)
 
     def validate_credentials(self, model: str, credentials: dict) -> None:
         """
